@@ -80,6 +80,9 @@ CCCCCCCC = checksum? Note that this sketch only looks at the first 6 bytes and i
 
 #ifdef ESP8266
 #include <ESP8266WiFiMulti.h>
+#include <ESP8266WebServer.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 #endif
 #ifdef ESP32
 #include <WiFiMulti.h>
@@ -109,6 +112,8 @@ CCCCCCCC = checksum? Note that this sketch only looks at the first 6 bytes and i
 
 #define DEBUG 1
 
+const char* CONFIG_FILE = "/config.json";
+
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
 IPAddress MQTT_SERVER;
@@ -119,10 +124,10 @@ PubSubClient mqtt_client(espClient);
 #define countof(x) (sizeof(x)/sizeof(x[0]))
 // Interface Defini tions
 #ifdef ESP8266
-int RxPin = D4; //The number of signal from the Rx
+int RxPin = D5; //The number of signal from the Rx
 #endif
 #ifdef ESP32
-int RxPin = 27; //The number of signal from the Rx
+int RxPin = D23; //The number of signal from the Rx
 #endif
 
 // Variables for Manchester Receiver Logic:
@@ -157,6 +162,121 @@ int ChanTemp[9]; //make one extra so we can index 1 relative
 int ChanHum[9];
 int Battery = 0;
 unsigned long t;
+
+// Webserver
+ESP8266WebServer server(80);
+
+// Data structure
+struct ConfigItem {
+    int channel;
+    String topic;
+    String subTempTopic;
+};
+
+struct DeviceConfig {
+    ConfigItem items[4];
+};
+
+DeviceConfig config;
+
+// ===== Load / Save =====
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+
+
+void saveConfig() {
+    DynamicJsonDocument doc(1024);
+
+    JsonArray arr = doc.createNestedArray("items");
+
+    for (int i = 0; i < 4; i++) {
+        JsonObject obj = arr.createNestedObject();
+        obj["channel"] = config.items[i].channel;
+        obj["topic"] = config.items[i].topic;
+        obj["subTempTopic"] = config.items[i].subTempTopic;
+    }
+
+    File file = LittleFS.open(CONFIG_FILE, "w");
+    if (!file) {
+        Serial.println("Failed to open config file for writing");
+        return;
+    }
+
+    serializeJson(doc, file);
+    file.close();
+}
+
+void loadConfig() {
+    if (!LittleFS.exists(CONFIG_FILE)) {
+        Serial.println("No config file, using defaults");
+        return;
+    }
+
+    File file = LittleFS.open(CONFIG_FILE, "r");
+    if (!file) {
+        Serial.println("Failed to open config file");
+        return;
+    }
+
+    DynamicJsonDocument doc(1024);
+    DeserializationError err = deserializeJson(doc, file);
+
+    if (err) {
+        Serial.println("Failed to parse config");
+        file.close();
+        return;
+    }
+
+    JsonArray arr = doc["items"];
+
+    for (unsigned int i = 0; i < 4 && i < arr.size(); i++) {
+        config.items[i].channel = arr[i]["channel"] | 0;
+        config.items[i].topic = arr[i]["topic"] | "";
+        config.items[i].subTempTopic = arr[i]["subTempTopic"] | "";
+    }
+
+    file.close();
+}
+
+
+String htmlPage() {
+    String page = "<html><body>";
+    page += "<h2>ESP8266 Config</h2>";
+    page += "<form method='POST' action='/save'>";
+
+    for (int i = 0; i < 4; i++) {
+        page += "<fieldset><legend>Item " + String(i) + "</legend>";
+
+        page += "Channel: <input name='ch" + String(i) + "' value='" + String(config.items[i].channel) + "'><br>";
+        page += "Topic: <input name='top" + String(i) + "' value='" + config.items[i].topic + "'><br>";
+        page += "SubTempTopic: <input name='sub" + String(i) + "' value='" + config.items[i].subTempTopic + "'><br>";
+
+        page += "</fieldset><br>";
+    }
+
+    page += "<input type='submit' value='Save'>";
+    page += "</form></body></html>";
+
+    return page;
+}
+
+void handleRoot() {
+    server.send(200, "text/html", htmlPage());
+}
+
+void handleSave() {
+    for (int i = 0; i < 4; i++) {
+        config.items[i].channel = server.arg("ch" + String(i)).toInt();
+        config.items[i].topic = server.arg("top" + String(i));
+        config.items[i].subTempTopic = server.arg("sub" + String(i));
+    }
+
+    saveConfig();
+
+    server.send(200, "text/html", "<h2>Saved! Rebooting...</h2>");
+    delay(1500);
+    ESP.restart();
+}
 
 // Connect to Wifi and report IP address
 void start_Wifi()
@@ -226,7 +346,29 @@ uint8_t Checksum(int length, uint8_t *buff)
     return checksum;
 }
 
+String getProbeFromChannel(int channel) 
+{
+    String result("");
+    for (int i = 0; i < 4; i++) {
+        if (channel == config.items[i].channel) {                    
+            result = config.items[i].topic;
+            return result;
+        }
+    }
+    return result;
+}
 
+String getTopicFromChannel(int channel) 
+{
+    String result("");
+    for (int i = 0; i < 4; i++) {
+        if (channel == config.items[i].channel) {                    
+            result = config.items[i].subTempTopic;
+            return result;
+        }
+    }
+    return result;
+}
 
 //Read the binary data from the bank and apply conversions where necessary to scale and format data
 
@@ -258,7 +400,7 @@ void add(byte bitData)
         Newhum = (manchester [5]);
 
         Battery = int(manchester[3] >> 7);
-
+        Battery = !Battery;
         Serial.println(Battery);
 
         if ( Checksum (countof(manchester) - 2, manchester + 1) == manchester[MAX_BYTES - 1])
@@ -314,16 +456,18 @@ void add(byte bitData)
                 String source = "\"source\": \"esp32_" + chipId + "\"";
                 #endif
 
-                String topic = MQTT_TOPIC_BASE + String(stnId) + "/data/temperature";
-                String payload = "{\"value\": " + String(Tvalue, 1) + ", " + source + "}";
+                String loc = getProbeFromChannel(stnId);
+                String tempTopic = getTopicFromChannel(stnId);
+                String topic = MQTT_TOPIC_BASE + loc + "/" + tempTopic;
+                String payload = String(Tvalue, 1);
                 mqtt_client.publish(topic.c_str(), payload.c_str());
                 
-                topic = MQTT_TOPIC_BASE + String(stnId) + "/data/humidity";
-                payload = "{\"value\": " + String(Newhum) + ", " + source + "}";
+                topic = MQTT_TOPIC_BASE + loc + "/humidity";
+                payload = String(Newhum) ;
                 mqtt_client.publish(topic.c_str(), payload.c_str());
                 
-                topic = MQTT_TOPIC_BASE + String(stnId) + "/data/low_battery";
-                payload = "{\"value\": " + String(Battery) + ", " + source + "}";
+                topic = MQTT_TOPIC_BASE + loc + "/battery";
+                payload = String(Battery);
                 mqtt_client.publish(topic.c_str(), payload.c_str());
                 delay(5000);
 
@@ -426,7 +570,7 @@ void loop()
     }
     #endif
     lecture();
-
+    server.handleClient();
 } //end of mainloop
 
 
@@ -439,5 +583,17 @@ void setup()
       
     pinMode(RxPin, INPUT);
     eraseManchester(); //clear the array to different nos cause if all zeroes it might think that is a valid 3 packets ie all equal
+   
+    if (!LittleFS.begin()) {
+        Serial.println("LittleFS mount failed");
+        return;
+    }
+
+    loadConfig();
+
+    server.on("/", handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+
+    server.begin();
 }
 
