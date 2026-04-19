@@ -111,6 +111,12 @@ CCCCCCCC = checksum? Note that this sketch only looks at the first 6 bytes and i
 #endif
 
 #define DEBUG 1
+#include <WebSocketsServer.h>
+// ===== Load / Save =====
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+
+
 
 const char* CONFIG_FILE = "/config.json";
 
@@ -163,8 +169,103 @@ int ChanHum[9];
 int Battery = 0;
 unsigned long t;
 
+// ----------- TIMERS -----------
+unsigned long lastWifiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
+unsigned long debugTimer = 0;
+
+// ----------- STATE -----------
+bool wifiConnected = false;
+
 // Webserver
 ESP8266WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+
+class Logger {
+public:
+    void begin(WebSocketsServer* ws) {
+        _ws = ws;
+    }
+
+    // --- PRINT (no newline) ---
+    void print(const String& msg) {
+        _currentLine += msg;
+        Serial.print(msg);
+    }
+
+    void print(const char* msg) {
+        _currentLine += msg;
+        Serial.print(msg);
+    }
+
+    void print(int value) {
+        _currentLine += String(value);
+        Serial.print(value);
+    }
+
+    void print(float value, int precision = 2) {
+        String s = String(value, precision);
+        _currentLine += s;
+        Serial.print(s);
+    }
+
+    // --- PRINTLN (flush line) ---
+    void println(const String& msg = "") {
+        _currentLine += msg;
+        Serial.println(msg);
+        flush();
+    }
+
+    void println(int value) {
+        print(value);
+        println();
+    }
+
+    void println(float value, int precision = 2) {
+        print(value, precision);
+        println();
+    }
+
+private:
+    WebSocketsServer* _ws = nullptr;
+    String _currentLine;
+    String _buffer;
+    const size_t MAX_BUFFER = 2000;
+
+    void flush() {
+        String line = "[" + String(millis()) + "] " + _currentLine;
+
+        // Send to WebSocket clients
+        if (_ws) {
+            _ws->broadcastTXT(line);
+        }
+
+        // Store in buffer
+        _buffer += line + "\n";
+        if (_buffer.length() > MAX_BUFFER) {
+            _buffer.remove(0, _buffer.length() - MAX_BUFFER);
+        }
+
+        _currentLine = "";
+    }
+
+public:
+    // Send buffer to new client
+    void sendHistory(uint8_t clientNum) {
+        if (_ws) {
+            _ws->sendTXT(clientNum, _buffer);
+        }
+    }
+
+    void clear() {
+        _buffer = "";
+    }
+};
+
+
+// Logger
+Logger Log;
 
 // Data structure
 struct ConfigItem {
@@ -179,9 +280,30 @@ struct DeviceConfig {
 
 DeviceConfig config;
 
-// ===== Load / Save =====
-#include <LittleFS.h>
-#include <ArduinoJson.h>
+
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    switch (type) {
+        
+        case WStype_CONNECTED: {
+            IPAddress ip = webSocket.remoteIP(num);
+            Serial.printf("WS Client %u connected\n", num);
+
+            // send history via logger
+            Log.sendHistory(num);
+            break;
+            }
+        case WStype_DISCONNECTED:
+            Serial.printf("WS Client %u disconnected\n", num);
+            break;
+
+        case WStype_TEXT:
+            // Optional: handle incoming messages from browser
+            break;
+        default:
+            break;
+    }
+}
 
 
 void saveConfig() {
@@ -241,9 +363,10 @@ void loadConfig() {
 
 String htmlPage() {
     String page = "<html><body>";
-    page += "<h2>ESP8266 Config</h2>";
-    page += "<form method='POST' action='/save'>";
 
+    page += "<h2>ESP8266 Config</h2>";
+
+    page += "<form method='POST' action='/save'>";
     for (int i = 0; i < 4; i++) {
         page += "<fieldset><legend>Item " + String(i) + "</legend>";
 
@@ -253,10 +376,35 @@ String htmlPage() {
 
         page += "</fieldset><br>";
     }
-
     page += "<input type='submit' value='Save'>";
-    page += "</form></body></html>";
+    page += "</form>";
 
+    // 👇 Terminal UI
+    page += "<h3>Live Console</h3>";
+    page += "<pre id='console' style='background:black;color:#0f0;height:300px;overflow:auto;'></pre>";
+
+    // 👇 WebSocket JS
+    page += R"rawliteral(
+<script>
+let ws = new WebSocket("ws://" + location.hostname + ":81/");
+
+ws.onopen = function() {
+    console.log("WebSocket connected");
+};
+
+ws.onmessage = function(event) {
+    let consoleBox = document.getElementById("console");
+    consoleBox.textContent += event.data + "\n";
+    consoleBox.scrollTop = consoleBox.scrollHeight;
+};
+
+ws.onclose = function() {
+    console.log("WebSocket disconnected");
+};
+</script>
+)rawliteral";
+
+    page += "</body></html>";
     return page;
 }
 
@@ -278,15 +426,38 @@ void handleSave() {
     ESP.restart();
 }
 
+void connectWiFi()
+{
+    Serial.println("Connecting WiFi...");
+
+    WiFi.begin(ssid, password);
+}
+
+void reconnectWiFi()
+{
+    unsigned long now = millis();
+
+    if (now - lastWifiAttempt < 5000) return;
+
+    Serial.println("Reconnecting WiFi...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+
+    lastWifiAttempt = now;
+}
+
 // Connect to Wifi and report IP address
 void start_Wifi()
 {
     #ifdef DEBUG
     Serial.println("Starting Wifi");
+    Serial.print("ssid: ");
+    Serial.println(ssid);
     #endif
     WiFi.mode(WIFI_STA);
+    WiFi.setSleepMode(WIFI_NONE_SLEEP); // improves stability
     WiFi.persistent(false);
-    WiFi.begin(ssid, password);
+    connectWiFi();
     int counter = 0;
     while ((WiFi.status() != WL_CONNECTED) && (counter < 200))
     {
@@ -309,6 +480,19 @@ void start_Wifi()
     Serial.println(WiFi.localIP());
     #endif
     WiFi.setAutoReconnect(true);
+}
+
+void reconnectMQTT()
+{
+    if (!mqtt_client.connected())
+    {
+        Serial.println("Reconnecting MQTT...");
+        if (mqtt_client.connect("ESP8266Client"))
+        {
+            Serial.println("MQTT connected");
+            // resubscribe here if needed
+        }
+    }
 }
 
 uint8_t Checksum(int length, uint8_t *buff)
@@ -427,17 +611,17 @@ void add(byte bitData)
                     stnId,
                     str_Tvalue,
                     Newhum);
-                Serial.print(Buff);
-                Serial.print("Canal:");
-                Serial.println(stnId);
-                Serial.print("Température:");
-                Serial.print(Tvalue,2);
-                Serial.println(" °C");
-                Serial.print("Hygrométrie:");
-                Serial.print(Newhum);
-                Serial.println(" %");
-                Serial.print("Low battery:");
-                Serial.println(Battery);
+                Log.print(Buff);
+                Log.print("Canal:");
+                Log.println(stnId);
+                Log.print("Température:");
+                Log.print(Tvalue,2);
+                Log.println(" °C");
+                Log.print("Hygrométrie:");
+                Log.print(Newhum);
+                Log.println(" %");
+                Log.print("Low battery:");
+                Log.println(Battery);
 
                 if (!mqtt_client.connected())
                 {
@@ -460,15 +644,18 @@ void add(byte bitData)
                 String tempTopic = getTopicFromChannel(stnId);
                 String topic = MQTT_TOPIC_BASE + loc + "/" + tempTopic;
                 String payload = String(Tvalue, 1);
-                mqtt_client.publish(topic.c_str(), payload.c_str());
-                
+                int result = mqtt_client.publish(topic.c_str(), payload.c_str());
+                Log.println("Publish " + topic+ " " + payload + " Result: " +String(result) );
+
                 topic = MQTT_TOPIC_BASE + loc + "/humidity";
                 payload = String(Newhum) ;
                 mqtt_client.publish(topic.c_str(), payload.c_str());
+                Log.println("Publish " + topic+ " " + payload + " Result: " +String(result) );
                 
                 topic = MQTT_TOPIC_BASE + loc + "/battery";
                 payload = String(Battery);
                 mqtt_client.publish(topic.c_str(), payload.c_str());
+                Log.println("Publish " + topic+ " " + payload + " Result: " +String(result) );
                 delay(5000);
 
             }
@@ -545,7 +732,7 @@ void lecture() {
                    {
                        firstZero = true;
                        add(bitState);//Add first zero to bytes
-                       Serial.print("!");
+                       Log.print("!");
                    }//end of finding first zero
                    else
                    {
@@ -565,10 +752,20 @@ void loop()
     #ifdef DEBUG
     if (millis() > t + 10000)
     {
-         Serial.println("--check--");
+         Log.println("--check--");
          t = millis(); 
     }
     #endif
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        reconnectWiFi();
+    }
+    if (WiFi.status() == WL_CONNECTED)
+    {
+    reconnectMQTT();
+    mqtt_client.loop();
+    webSocket.loop();
+    }
     lecture();
     server.handleClient();
 } //end of mainloop
@@ -595,5 +792,9 @@ void setup()
     server.on("/save", HTTP_POST, handleSave);
 
     server.begin();
+    //  WebSocket
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+    Log.begin(&webSocket);
 }
 
